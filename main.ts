@@ -19,15 +19,27 @@
 //           +$22 on the local sweep, and clears the dev gate (net PnL above $0).
 //
 //   RACE MODE (bars from 2026-11-23T11:26:00Z, 15 minutes after the deadline):
-//     Yans's own ICT level: ENTRY AT 61,060 (the daily FVG zone on his BTC/USDT
-//     chart; BTC is near 61,388 at the time of writing). Buy the first time price
-//     touches/enters the zone 61,060 +/- 0.30%. Exit at take profit +200 bps,
-//     trailing stop 100 bps from the peak, hard stop -150 bps. Re-entry is allowed
-//     once price has left the zone upward again after an exit.
-//     FALLBACK, race mode only, while the 61,060 zone has never been touched:
-//     a dip buyer -- buy when the close falls 1.5% or more under the trailing high,
-//     same exits, re-entry allowed. This guarantees the bot still trades (the
-//     guardrail needs at least 1 filled trade) if the level never prints.
+//     Yans's own ICT levels, on his BTC/USDT chart (BTC near 61,388 when set):
+//       LEG 1: ENTRY AT 61,060 (the daily FVG zone), zone 61,060 +/- 0.30%.
+//         Exit: TP absolut 64,000, SL absolut 60,700. NO trailing stop --
+//         a 1% trail would sell too early on the way to 64k (+4.8% from
+//         61,060). Re-entry at 61,060 only after a TP exit, never after a
+//         stop-out: once stopped out at 60,700, leg 1 is dead for the race.
+//       LEG 2: after the 60,700 stop-out (or if price gaps straight there
+//         without leg 1 ever firing), BUY AGAIN AT 60,300 (zone +/- 0.30%).
+//         Exit: TP absolut 64,000, SL -150 bps from the leg-2 entry fill.
+//         One shot per cycle; after leg 2 stops out the ladder is done.
+//       RACE-START DIP: on the first live bar at/after 11:26:00Z, if the
+//         close is already 1.5% under 61,060 (<= 60,144.1 -- the drop happened
+//         before the window, so the trailing high never saw it), buy at once
+//         as a leg-2 entry. Covers price already under 60,300 at the open.
+//       FALLBACK, race mode only, while NEITHER level has ever been touched:
+//         a dip buyer -- buy when the close falls 1.5% or more under the
+//         trailing high, same leg-2 exits. Guarantees the bot still trades
+//         (the guardrail needs at least 1 filled trade) if no level prints.
+//     HOLD 24 JAM: once a position is open there is NO time-based exit --
+//     it holds until TP 64,000, its SL, or the 24h window ends (the grader
+//     marks the open position at the final price). No other exit exists.
 //
 // Protocol: agent-fun/bars-replay/v1 through the kit SDK shim in vendor/.
 // Long only, at most one open position, at most 16 orders per reply, every order
@@ -37,14 +49,18 @@ import { runBars, type BarsState, type Batch, type BuyInput, type SellInput } fr
 
 // The dev window ends at the competition opening (cut.json window.end_ms).
 const DEV_END_MS = 1795410660000;
-// Yans's ICT entry level, in USDC per BTC.
+// Yans's ICT entry levels, in USDC per BTC.
 const LEVEL_USDC = 61060;
+const LEVEL2_USDC = 60300;
+// Leg-1 stop loss (absolute) and the take profit (absolute, both legs).
+const SL1_USDC = 60700;
+const TP_USDC = 64000;
 // The FVG zone is the level +/- this many bps.
 const ZONE_BPS = 30;
-// Race-mode exits, in bps from the entry fill.
-const TP_BPS = 200;
-const TRAIL_BPS = 100;
+// Leg-2 stop loss, in bps under the leg-2 entry fill.
 const STOP_BPS = 150;
+// Race window starts 2026-11-23T11:26:00Z (DEV_END_MS + 6h15m).
+const RACE_START_MS = 1795433160000;
 // Fallback dip: buy this many bps under the trailing high.
 const DIP_BPS = 150;
 // Slippage cap on every order, 1% past the close it was decided on.
@@ -76,14 +92,24 @@ let dpStreak = 0;
 
 // ---- race mode state --------------------------------------------------------
 let raceHigh = 0n; // highest close seen in race mode (trailing high)
-let ictTouched = false; // the 61,060 zone has been touched at least once
-let ictArmed = true; // may enter on a zone touch (re-arms above the zone)
+let level1Touched = false; // the 61,060 zone has been touched at least once
+let level2Touched = false; // the 60,300 zone has been touched at least once
+let level1Armed = true; // may enter zone 1 (re-arms above the zone)
+let level1Dead = false; // zone 1 permanently dead after a stop-out (until a TP resets the cycle)
+let level2Armed = true; // may enter zone 2 (re-arms above the zone)
+let level2Used = false; // leg 2 already fired this cycle (one shot; a TP resets it)
+let entryLeg = 0; // 0 = flat, 1 = entered at 61,060, 2 = entered at 60,300 / dip / race-start dip
+let raceStartChecked = false; // race-start dip rule evaluated once, on the first live bar >= RACE_START_MS
 let entryPrice: bigint | null = null; // fill price of the open position (raw)
-let peak: bigint | null = null; // highest close since entry (raw)
 
-/** The ICT zone as raw prices at the symbol's price_scale. */
-function zone(): { low: bigint; high: bigint } {
-  const level = BigInt(LEVEL_USDC) * 10n ** BigInt(priceScale);
+/** A USDC level as a raw price at the symbol's price_scale. */
+function rawLevel(usdc: number): bigint {
+  return BigInt(usdc) * 10n ** BigInt(priceScale);
+}
+
+/** An ICT zone (level +/- ZONE_BPS) as raw prices at the symbol's price_scale. */
+function zoneFor(levelUsdc: number): { low: bigint; high: bigint } {
+  const level = rawLevel(levelUsdc);
   return {
     low: (level * BigInt(10000 - ZONE_BPS)) / 10000n,
     high: (level * BigInt(10000 + ZONE_BPS)) / 10000n,
@@ -160,10 +186,12 @@ await runBars({
       if (fill.status !== 'filled' || fill.symbol !== symbol) continue;
       if (fill.side === 'buy') {
         entryPrice = BigInt(fill.price);
-        peak = entryPrice;
+        // A filled leg-2 buy spends the one shot for this cycle. (Set here,
+        // on the fill, not at the decision: a rejected buy must stay retryable.)
+        if (entryLeg === 2) level2Used = true;
       } else {
         entryPrice = null;
-        peak = null;
+        entryLeg = 0;
       }
     }
     if (bar === undefined) return [];
@@ -209,42 +237,103 @@ await runBars({
       return [];
     }
 
-    // ---- RACE MODE: ICT level 61,060, dip fallback while untouched --------
+    // ---- RACE MODE: ICT ladder 61,060 -> SL 60,700 -> buy again 60,300 ----
+    // ---- TP absolut 64,000, no trailing stop, hold 24 jam ------------------
     if (close > raceHigh) raceHigh = close;
-    const z = zone();
-    if (low <= z.high && high >= z.low) ictTouched = true;
-    if (close > z.high) ictArmed = true;
+    const z1 = zoneFor(LEVEL_USDC);
+    const z2 = zoneFor(LEVEL2_USDC);
+    if (low <= z1.high && high >= z1.low) level1Touched = true;
+    if (low <= z2.high && high >= z2.low) level2Touched = true;
+    if (!level1Dead && close > z1.high) level1Armed = true;
+    if (!level2Used && close > z2.high) level2Armed = true;
+    // The race-start dip rule fires once, on the first live bar at/after the
+    // race window opens (11:26:00Z) -- a drop that happened before the window
+    // never shows in the trailing high, so a 1.5% fall is checked directly
+    // against the 61,060 level instead.
+    const isRaceStartBar = !raceStartChecked && bar.t >= RACE_START_MS;
+    if (isRaceStartBar) raceStartChecked = true;
 
     const held = state.positions.get(symbol);
     const isLong = held !== undefined && held.qty > 0n;
     if (isLong) {
       const entry = openEntryPrice(state);
       if (entry === null) return [];
-      if (peak === null || close > peak) peak = close;
-      const tp = (entry * BigInt(10000 + TP_BPS)) / 10000n;
-      const stop = (entry * BigInt(10000 - STOP_BPS)) / 10000n;
-      const trailHit = peak > entry && close <= (peak * BigInt(10000 - TRAIL_BPS)) / 10000n;
-      if (close >= tp || close <= stop || trailHit) {
-        // Exiting: disarm the ICT entry until price is back above the zone,
-        // and restart the trailing high from here for the dip fallback.
-        ictArmed = false;
+      // TP absolut 64,000 (both legs): a touch of the level exits, and a TP
+      // exit resets the whole cycle -- both levels live again.
+      if (high >= rawLevel(TP_USDC)) {
+        level1Armed = false;
+        level1Dead = false;
+        level2Armed = false;
+        level2Used = false;
         raceHigh = close;
         entryPrice = null;
-        peak = null;
+        entryLeg = 0;
         const sell = fullSell(state);
         return sell === null ? [] : [sell];
+      }
+      if (entryLeg === 1) {
+        // Leg-1 stop loss, absolut 60,700: a touch exits, leg 1 is dead for
+        // the race, and the only next entry is leg 2 at 60,300.
+        if (low <= rawLevel(SL1_USDC)) {
+          level1Armed = false;
+          level1Dead = true;
+          level2Armed = true;
+          raceHigh = close;
+          entryPrice = null;
+          entryLeg = 0;
+          const sell = fullSell(state);
+          return sell === null ? [] : [sell];
+        }
+      } else {
+        // Leg-2 stop loss, -150 bps under its own entry fill: the ladder is
+        // done, both levels dead for the rest of the race.
+        const stop = (entry * BigInt(10000 - STOP_BPS)) / 10000n;
+        if (low <= stop) {
+          level1Armed = false;
+          level1Dead = true;
+          level2Armed = false;
+          level2Used = true;
+          raceHigh = close;
+          entryPrice = null;
+          entryLeg = 0;
+          const sell = fullSell(state);
+          return sell === null ? [] : [sell];
+        }
       }
       return [];
     }
 
     // Flat: entries.
-    const inZone = close >= z.low && close <= z.high;
-    const wickedZone = low <= z.high && close >= z.low;
-    if (ictArmed && (inZone || wickedZone)) {
+    // (a) Race-start dip: already 1.5% under 61,060 when the window opens --
+    // buy at once as a leg-2 entry, do not wait for a level.
+    if (isRaceStartBar) {
+      const dipRaw = (rawLevel(LEVEL_USDC) * BigInt(10000 - DIP_BPS)) / 10000n;
+      if (close <= dipRaw) {
+        entryLeg = 2;
+        const buy = fullBuy(state);
+        return buy === null ? [] : [buy];
+      }
+    }
+    // (b) Leg 1 at 61,060 (+/- 0.30%), only while it is armed and not dead.
+    const inZone1 = close >= z1.low && close <= z1.high;
+    const wickedZone1 = low <= z1.high && close >= z1.low;
+    if (level1Armed && !level1Dead && (inZone1 || wickedZone1)) {
+      entryLeg = 1;
       const buy = fullBuy(state);
       return buy === null ? [] : [buy];
     }
-    if (!ictTouched && raceHigh > 0n && close <= (raceHigh * BigInt(10000 - DIP_BPS)) / 10000n) {
+    // (c) Leg 2 at 60,300 (+/- 0.30%): after the 60,700 stop-out, or straight
+    // there if price gapped through leg 1. One shot per cycle.
+    const inZone2 = close >= z2.low && close <= z2.high;
+    const wickedZone2 = low <= z2.high && close >= z2.low;
+    if (level2Armed && !level2Used && (inZone2 || wickedZone2)) {
+      entryLeg = 2;
+      const buy = fullBuy(state);
+      return buy === null ? [] : [buy];
+    }
+    // (d) Dip fallback, only while neither level has ever been touched.
+    if (!level1Touched && !level2Touched && raceHigh > 0n && close <= (raceHigh * BigInt(10000 - DIP_BPS)) / 10000n) {
+      entryLeg = 2;
       const buy = fullBuy(state);
       return buy === null ? [] : [buy];
     }
